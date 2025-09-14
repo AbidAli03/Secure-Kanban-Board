@@ -1,5 +1,7 @@
 import os
 import sys
+import xml.etree.ElementTree as ET  # XML read/write (build/parse tree)
+import xml.dom.minidom  # Pretty-print XML for readability
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QLabel, QPushButton, QVBoxLayout, QWidget, QDialog,
@@ -8,7 +10,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QFont, QMouseEvent, QRegion, QPainterPath
 from PyQt6.QtCore import Qt, QPoint, QTime, QTimer, QRectF, QPropertyAnimation, QEasingCurve, QDate, QRect
-
+from xml.etree.ElementTree import Element, SubElement  # Shortcuts to build XML elements
 
 class TaskDetailsPopup(QDialog):
     def __init__(self, task, parent=None):
@@ -109,6 +111,21 @@ class TaskDetailsPopup(QDialog):
         self.setLayout(layout)
 
     def save_task_details(self):
+        # Track which fields changed for logging
+        changes = []
+
+        if self.task.title != self.title_input.text():
+            changes.append("Title")
+        if self.task.assignee != self.assignee_input.text():
+            changes.append("Assignee")
+        if self.task.start_date != self.start_date_input.date():
+            changes.append("Start Date")
+        if self.task.end_date != self.end_date_input.date():
+            changes.append("End Date")
+        if self.task.description != self.description_input.toPlainText():
+            changes.append("Description")
+
+        # Apply updates to the task object (these values are later saved to XML)
         self.task.title = self.title_input.text()
         self.task.assignee = self.assignee_input.text()
         self.task.start_date = self.start_date_input.date()
@@ -117,8 +134,16 @@ class TaskDetailsPopup(QDialog):
 
         self.task.setText(self.task.title)
         self.task.update_tooltip()
-        self.accept()
 
+        # Log edits (logs go to CSV, not XML)
+        if changes:
+            if hasattr(self.task.kanban_window, "append_log_entry"):
+                self.task.kanban_window.append_log_entry(
+                    "Task Edited",
+                    f"'{self.task.title}' fields changed: {', '.join(changes)}"
+                )
+
+        self.accept()
 
 class Task(QLabel):
     def __init__(self, text, kanban_window, parent=None):
@@ -144,6 +169,7 @@ class Task(QLabel):
         self.setMaximumHeight(50)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
+        # Task data that will be serialised to XML
         self.title = text
         self.assignee = ""
         self.start_date = QDate.currentDate()
@@ -201,6 +227,7 @@ class Task(QLabel):
         popup.exec()
 
     def update_tooltip(self):
+        # Tooltip combines current task state (these values are what XML persists)
         days_remaining = ""
         if self.end_date and isinstance(self.end_date, QDate):
             today = QDate.currentDate()
@@ -222,6 +249,7 @@ class Task(QLabel):
     def delete_task(self):
         try:
             parent_widget = self.parent()
+            self.kanban_window.append_log_entry("Task Deleted", f"'{self.title}' deleted")
 
             parent_layout = parent_widget.layout()
             if parent_layout:
@@ -244,13 +272,39 @@ class Task(QLabel):
         except Exception as e:
             print(f"Error deleting task: {e}")
 
+    def to_xml(self):
+        # Convert this Task to an XML <task> element with child tags
+        task_element = Element("task")
+        SubElement(task_element, "title").text = self.title
+        SubElement(task_element, "assignee").text = self.assignee
+        # Dates stored as strings so they are easy to parse later
+        SubElement(task_element, "start_date").text = self.start_date.toString("yyyy-MM-dd")
+        SubElement(task_element, "end_date").text = self.end_date.toString("yyyy-MM-dd")
+        SubElement(task_element, "description").text = self.description
+        return task_element
+
+    @classmethod
+    def from_xml(cls, xml_element, kanban_window, parent=None):
+        # Build a Task object from a <task> XML element
+        title = xml_element.find("title").text
+        task = cls(title, kanban_window, parent)
+        task.assignee = xml_element.find("assignee").text
+        start_date_str = xml_element.find("start_date").text
+        if start_date_str:
+            task.start_date = QDate.fromString(start_date_str, "yyyy-MM-dd")
+        end_date_element = xml_element.find("end_date")
+        if end_date_element is not None and end_date_element.text:
+            task.end_date = QDate.fromString(end_date_element.text, "yyyy-MM-dd")
+        task.description = xml_element.find("description").text
+        task.update_tooltip()
+        return task
 
 class Column(QFrame):
     def __init__(self, title, parent_board):
         super().__init__()
         self.parent_board = parent_board
         self.title = title
-        self.wip_limit = 0
+        self.wip_limit = 0  # Saved to XML as an attribute on <column>
 
         self.setStyleSheet("""
             QFrame {
@@ -324,7 +378,7 @@ class Column(QFrame):
             color: #E0E0E0;
         """)
         self.header_layout.addWidget(self.label)
-        self.label.mouseDoubleClickEvent = self.label_double_clicked
+        self.label.mouseDoubleClickEvent = self.label_double_clicked  # Rename on double click (name persisted in XML)
 
         self.control_layout = QHBoxLayout()
         self.control_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -413,6 +467,13 @@ class Column(QFrame):
             previous_limit = self.wip_limit
             self.wip_limit = spin_box.value()
             self.update_wip_display()
+            # Log changes (CSV). WIP is also persisted in XML as column attribute.
+            if previous_limit == 0 and self.wip_limit > 0:
+                self.parent_board.append_log_entry("WIP Limit Set",
+                    f"WIP limit for '{self.title}' set to {self.wip_limit}")
+            elif previous_limit != self.wip_limit:
+                self.parent_board.append_log_entry("WIP Limit Changed",
+                    f"WIP limit for '{self.title}' changed from {previous_limit} to {self.wip_limit}")
             dialog.accept()
 
         ok_button.clicked.connect(on_ok)
@@ -476,6 +537,7 @@ class Column(QFrame):
         old_title = self.title
         new_title = self.edit_line.text().strip()
         if new_title and new_title != old_title:
+            # Prevent duplicate "To Do" columns
             if new_title.lower() == "to do":
                 for col in self.parent_board.columns:
                     if col is not self and col.title.lower() == "to do":
@@ -487,8 +549,15 @@ class Column(QFrame):
                         self.layout.replaceWidget(self.edit_line, self.label)
                         self.edit_line.deleteLater()
                         return
+
             self.label.setText(new_title)
             self.title = new_title
+            # Column title is saved into XML attribute on next save
+            if hasattr(self.parent_board, "append_log_entry"):
+                self.parent_board.append_log_entry(
+                    "Column Renamed",
+                    f"'{old_title}' renamed to '{new_title}'"
+                )
 
         self.layout.replaceWidget(self.edit_line, self.label)
         self.edit_line.deleteLater()
@@ -499,6 +568,7 @@ class Column(QFrame):
             self.parent_board.columns[current_idx], self.parent_board.columns[current_idx - 1] = \
                 self.parent_board.columns[current_idx - 1], self.parent_board.columns[current_idx]
             self.parent_board.rearrange_columns()
+            self.parent_board.append_log_entry("Column Moved", f"'{self.title}' moved left")
 
     def move_right(self):
         current_idx = self.parent_board.columns.index(self)
@@ -506,6 +576,7 @@ class Column(QFrame):
             self.parent_board.columns[current_idx], self.parent_board.columns[current_idx + 1] = \
                 self.parent_board.columns[current_idx + 1], self.parent_board.columns[current_idx]
             self.parent_board.rearrange_columns()
+            self.parent_board.append_log_entry("Column Moved", f"'{self.title}' moved right")
 
     def delete_column(self):
         if not self.parent_board.is_Admin:
@@ -525,8 +596,10 @@ class Column(QFrame):
 
         if confirm == QMessageBox.StandardButton.Yes:
             self.parent_board.remove_column(self)
+            self.parent_board.append_log_entry("Column Deleted", f"'{self.title}' column deleted")
 
     def add_task(self, task):
+        # Enforce WIP (also reflected in XML as wip_limit attribute)
         if self.wip_limit > 0 and self.get_task_count() >= self.wip_limit:
             return False
 
@@ -542,7 +615,6 @@ class Column(QFrame):
                 return i
         return -1
 
-
 class KanbanWindow(QMainWindow):
     def __init__(self, user_name="", is_Admin=False):
         super().__init__()
@@ -551,8 +623,10 @@ class KanbanWindow(QMainWindow):
         self.setFixedSize(1200, 700)
         self.round_window()
 
+        # The project name doubles as the XML filename prefix
         self.user_name = user_name
         self.is_Admin = is_Admin
+        self.filename = f"{self.user_name}.xml"
         self.task_counter = 0
         self.max_tasks = 50
         self.columns = []
@@ -621,7 +695,7 @@ class KanbanWindow(QMainWindow):
 
         self.save_button = QPushButton("Save", self)
         self.save_button.setFont(QFont("Arial", 16))
-        self.save_button.clicked.connect(self.close)
+        self.save_button.clicked.connect(self.save_and_close)
         self.save_button.setStyleSheet(self.button_style)
         bottom_layout.addWidget(self.save_button)
 
@@ -631,7 +705,9 @@ class KanbanWindow(QMainWindow):
         container.setLayout(self.main_layout)
         self.setCentralWidget(container)
         self.setStyleSheet("background-color: white;")
-        self.add_column("To Do")
+
+        # Load board state from XML on startup (if file exists)
+        self.load_from_xml()
 
     def round_window(self, radius=20):
         path = QPainterPath()
@@ -655,6 +731,22 @@ class KanbanWindow(QMainWindow):
         self.task_counter -= 1
         self.task_counter_label.setText(f"Tasks: {self.task_counter}/50")
 
+    def append_log_entry(self, action, details):
+        # CSV log for user actions (not XML). Used for audit/tracking.
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_folder = "Project Files"
+        if not os.path.exists(log_folder):
+            os.makedirs(log_folder)
+
+        log_path = os.path.join(log_folder, f"Log_{self.user_name}.csv")
+        is_new_file = not os.path.exists(log_path)
+
+        with open(log_path, "a", encoding="utf-8") as f:
+            if is_new_file:
+                f.write("timestamp,action,details\n")
+            f.write(f"{timestamp},{action},{details}\n")
+
     def add_column(self, title=None):
         if not title or not isinstance(title, str):
             title = f"Column {len(self.columns) + 1}"
@@ -665,8 +757,10 @@ class KanbanWindow(QMainWindow):
         column.wip_button.setVisible(self.is_Admin)
         self.columns.append(column)
         self.rearrange_columns()
+        self.append_log_entry("Column Created", f"'{title}' column added")
 
     def remove_column(self, column):
+        # When removing, also update the counter; tasks themselves are removed from UI
         task_layout = column.task_container.layout()
         task_count = sum(1 for i in range(task_layout.count())
                          if isinstance(task_layout.itemAt(i).widget(), Task))
@@ -675,8 +769,10 @@ class KanbanWindow(QMainWindow):
         self.columns.remove(column)
         column.setParent(None)
         self.rearrange_columns()
+        self.append_log_entry("Column Removed", f"'{column.title}' column removed")
 
     def rearrange_columns(self):
+        # Reposition columns in the grid (not persisted; only layout)
         for i in reversed(range(self.board_layout.count())):
             self.board_layout.itemAt(i).widget().setParent(None)
         for index, column in enumerate(self.columns):
@@ -704,15 +800,18 @@ class KanbanWindow(QMainWindow):
     def create_task(self):
         if self.task_counter >= self.max_tasks:
             return
+        # New tasks default into "To Do" column and will be included in XML on save
         to_do_column = next((col for col in self.columns if col.title == "To Do"), None)
         if to_do_column:
             task = Task(f"Task {self.task_counter + 1}", self, to_do_column.task_container)
+            self.append_log_entry("Task Created", f"'{task.title}' in column '{to_do_column.title}'")
             to_do_column.add_task(task)
             self.task_counter += 1
             self.task_counter_label.setText(f"Tasks: {self.task_counter}/50")
             to_do_column.update_wip_display()
 
     def snap_to_column(self, task):
+        # Handles drag-and-drop move between columns (state change logged; saved to XML on save)
         original_column = task.column
         original_index = -1
         if original_column:
@@ -735,6 +834,7 @@ class KanbanWindow(QMainWindow):
                 original_column.remove_task(task)
 
             if closest_column.add_task(task):
+                self.append_log_entry("Task Moved", f"'{task.title}' moved to '{closest_column.title}'")
                 return True
             else:
                 if original_column:
@@ -754,11 +854,92 @@ class KanbanWindow(QMainWindow):
 
         return False
 
+    def save_to_xml(self):
+        # Serialise the entire board to an XML file:
+        # <kanban_board>
+        #   <column name="..." wip_limit="...">
+        #       <task>...</task>
+        #   </column>
+        # </kanban_board>
+        if not self.user_name:
+            return
+        folder_path = "Project Files"
+        os.makedirs(folder_path, exist_ok=True)
+        file_path = os.path.join(folder_path, f"{self.user_name}.xml")
+
+        root = ET.Element("kanban_board")
+        for column in self.columns:
+            # Column data saved as element with attributes for title and WIP
+            column_element = ET.SubElement(root, "column", name=column.title, wip_limit=str(column.wip_limit))
+            # Add each Task as a child <task> element
+            for i in range(column.task_container.layout().count()):
+                task_widget = column.task_container.layout().itemAt(i).widget()
+                if isinstance(task_widget, Task):
+                    column_element.append(task_widget.to_xml())
+
+        # Pretty-print the XML (just for readability on disk)
+        rough_string = ET.tostring(root, 'utf-8')
+        reparsed = xml.dom.minidom.parseString(rough_string)
+        pretty_xml_as_string = reparsed.toprettyxml(indent="  ")
+
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(pretty_xml_as_string)
+
+    def load_from_xml(self):
+        # Load board state from XML; if file missing, create default "To Do" column
+        try:
+            # Clear existing columns before loading
+            for column in self.columns[:]:
+                self.remove_column(column)
+
+            folder_path = "Project Files"
+            file_path = os.path.join(folder_path, self.filename)
+            tree = ET.parse(file_path)  # Parse XML file into an ElementTree
+            root = tree.getroot()
+
+            for column_element in root.findall("column"):
+                column_name = column_element.get("name")
+                self.add_column(column_name)
+                column = self.columns[-1]
+
+                # WIP limit stored as attribute string; convert to int
+                wip_limit_str = column_element.get("wip_limit", "0")
+                try:
+                    column.wip_limit = int(wip_limit_str)
+                    column.update_wip_display()
+                except ValueError:
+                    column.wip_limit = 0
+
+                column.wip_button.setVisible(self.is_Admin)
+
+                # Recreate each task from its XML
+                for task_element in column_element.findall("task"):
+                    task = Task.from_xml(task_element, self, column.task_container)
+                    column.add_task(task)
+                    self.task_counter += 1
+
+            self.task_counter_label.setText(f"Tasks: {self.task_counter}/50")
+
+        except FileNotFoundError:
+            # No saved XML: start with a basic board
+            self.add_column("To Do")
+            for column in self.columns:
+                column.wip_button.setVisible(self.is_Admin)
+        except ET.ParseError as e:
+            # Bad/malformed XML: notify user
+            QMessageBox.critical(self, "XML Error", f"Error parsing XML file: {e}")
+
+    def save_and_close(self):
+        # Save current state to XML then close window
+        self.save_to_xml()
+        self.close()
+
     def open_main_menu(self):
+        # Save current state to XML and go back to main menu
+        self.save_to_xml()
         self.close()
         self.main_menu = MainMenu()
         self.main_menu.show()
-
 
 class LoadingScreen(QDialog):
     def __init__(self):
@@ -830,7 +1011,6 @@ class LoadingScreen(QDialog):
         self.main_menu = MainMenu()
         self.main_menu.show()
 
-
 class MainMenu(QWidget):
     def __init__(self, saved_user_name=""):
         super().__init__()
@@ -839,7 +1019,7 @@ class MainMenu(QWidget):
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.user_name = saved_user_name
-        self.saved_boards = []
+        self.saved_boards = self.load_saved_boards()
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         self.container = QWidget(self)
@@ -904,6 +1084,17 @@ class MainMenu(QWidget):
         if event.key() == Qt.Key.Key_Escape:
             self.close()
 
+    def load_saved_boards(self):
+        # Read available project names by listing XML files in the folder
+        saved_boards = []
+        folder_path = "Project Files"
+        if os.path.exists(folder_path):
+            for filename in os.listdir(folder_path):
+                if filename.endswith(".xml"):
+                    saved_boards.append(filename[:-4])  # strip .xml
+        saved_boards.sort()
+        return saved_boards
+
     def open_kanban(self, user_type):
         dialog = QDialog(self)
         dialog.setWindowTitle(f"Select {'or Enter' if user_type == 'Admin' else ''} Name")
@@ -926,6 +1117,7 @@ class MainMenu(QWidget):
         layout.setSpacing(15)
 
         name_list = QListWidget(container)
+        name_list.addItems(self.saved_boards)
         name_list.setStyleSheet("""
             QListWidget {
                 background-color: #7c3aed;
@@ -939,6 +1131,7 @@ class MainMenu(QWidget):
 
         name_input = None
         if user_type == "Admin":
+
             name_input = QLineEdit(container)
             name_input.setPlaceholderText("Enter project name here")
             name_input.setStyleSheet("""
@@ -977,16 +1170,32 @@ class MainMenu(QWidget):
                     color: white;
                     border-radius: 8px;
                     padding: 6px;
-                    font-weight: bold.
+                    font-weight: bold;
                 }
                 QPushButton:hover {
                     background-color: #16a34a;
                 }
             """)
-            download_button.clicked.connect(lambda: self.show_message("Info", "No project file to download (XML removed).", QMessageBox.Icon.Information))
+            download_button.clicked.connect(lambda: self.handle_download_project(name_list))
             downloads_layout.addWidget(download_button, stretch=1)
 
             downloads_layout.addStretch()
+
+            log_download_button = QPushButton("Download Logs", container)
+            log_download_button.setStyleSheet("""
+                QPushButton {
+                    background-color: #38bdf8;
+                    color: white;
+                    border-radius: 8px;
+                    padding: 6px;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    background-color: #0ea5e9;
+                }
+            """)
+            log_download_button.clicked.connect(lambda: self.handle_download_log(name_list))
+            downloads_layout.addWidget(log_download_button, stretch=1)
 
             layout.addLayout(downloads_layout)
 
@@ -1048,29 +1257,98 @@ class MainMenu(QWidget):
         current_pos = self.pos()
         self.close()
         is_Admin = user_type == "Admin"
+        # Opening a board will load its state from its XML file
         self.kanban_window = KanbanWindow(self.user_name, is_Admin)
         self.kanban_window.move(current_pos)
         self.kanban_window.show()
 
     def handle_download_project(self, name_list):
-        self.show_message("Info", "Project download not available (XML removed).", QMessageBox.Icon.Information)
+        selected_item = name_list.currentItem()
+        if selected_item:
+            self.download_project_file(selected_item.text())
+        else:
+            self.show_message("Error", "Please select a project to download.", QMessageBox.Icon.Warning)
+
+    def handle_download_log(self, name_list):
+        selected_item = name_list.currentItem()
+        if selected_item:
+            self.download_log_file(selected_item.text())
+        else:
+            self.show_message("Error", "Please select a project to download logs.", QMessageBox.Icon.Warning)
+
+    def download_project_file(self, project_name):
+        # Copies the project's XML file to a chosen location
+        folder_path = os.path.abspath("Project Files")
+        file_path = os.path.join(folder_path, f"{project_name}.xml")
+        if not os.path.exists(file_path):
+            self.show_message("Error", f"The file '{project_name}.xml' does not exist.", QMessageBox.Icon.Warning)
+            return
+
+        save_path, _ = QFileDialog.getSaveFileName(self, "Save Project As", f"{project_name}.xml",
+                                                   "XML Files (*.xml);;All Files (*)")
+        if save_path:
+            try:
+                import shutil
+                shutil.copy(file_path, save_path)
+                self.show_message("Success", f"Project saved as:\n{save_path}", QMessageBox.Icon.Information)
+            except Exception as e:
+                self.show_message("Error", f"Failed to save file: {e}", QMessageBox.Icon.Critical)
+
+    def download_log_file(self, project_name):
+        # Copies the CSV log file to a chosen location (separate from XML)
+        folder_path = os.path.abspath("Project Files")
+        file_path = os.path.join(folder_path, f"Log_{project_name}.csv")
+
+        if not os.path.exists(file_path):
+            self.show_message("Error", f"The log file for '{project_name}' does not exist.", QMessageBox.Icon.Warning)
+            return
+
+        save_path, _ = QFileDialog.getSaveFileName(self, "Save Log As", f"Log_{project_name}.csv",
+                                                   "CSV Files (*.csv);;All Files (*)")
+        if save_path:
+            try:
+                import shutil
+                shutil.copy(file_path, save_path)
+                self.show_message("Success", f"Log saved as:\n{save_path}", QMessageBox.Icon.Information)
+            except Exception as e:
+                self.show_message("Error", f"Failed to save log file: {e}", QMessageBox.Icon.Critical)
 
     def delete_project(self, name_list):
+        # Deletes only the XML (keeps logs), also appends a log entry
         selected_item = name_list.currentItem()
         if selected_item:
             project_name = selected_item.text()
+            folder_path = "Project Files"
+            file_path = os.path.join(folder_path, f"{project_name}.xml")
+            log_file_path = os.path.join(folder_path, f"Log_{project_name}.csv")
+
             confirm = QMessageBox.question(
                 self,
                 "Delete Confirmation",
-                f"Are you sure you want to remove '{project_name}' from the list?",
+                f"Are you sure you want to delete '{project_name}'?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
+
             if confirm == QMessageBox.StandardButton.Yes:
                 try:
-                    if project_name in self.saved_boards:
-                        self.saved_boards.remove(project_name)
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+
+                        from datetime import datetime
+                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                        if os.path.exists(log_file_path):
+                            with open(log_file_path, "a", encoding="utf-8") as log_file:
+                                log_file.write(f"{timestamp},Project Deleted,Project '{project_name}' XML deleted\n")
+                        else:
+                            with open(log_file_path, "w", encoding="utf-8") as log_file:
+                                log_file.write("timestamp,action,details\n")
+                                log_file.write(f"{timestamp},Project Deleted,Project '{project_name}' XML deleted\n")
+
+                    self.saved_boards.remove(project_name)
                     name_list.takeItem(name_list.row(selected_item))
-                    self.show_message("Success", f"Removed '{project_name}' from list.", QMessageBox.Icon.Information)
+                    self.show_message("Success", f"Deleted '{project_name}' (XML only, logs preserved)",
+                                      QMessageBox.Icon.Information)
                 except Exception as e:
                     self.show_message("Error", f"Deletion failed: {e}", QMessageBox.Icon.Critical)
         else:
@@ -1104,13 +1382,11 @@ class MainMenu(QWidget):
         """)
         msg.exec()
 
-
 class KanbanApp(QApplication):
     def __init__(self, sys_argv):
         super().__init__(sys_argv)
         self.loading_screen = LoadingScreen()
         self.loading_screen.show()
-
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
