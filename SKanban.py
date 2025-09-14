@@ -1,6 +1,5 @@
 import os
 import sys
-import csv
 import json
 import bcrypt
 import threading
@@ -9,43 +8,46 @@ import xml.etree.ElementTree as ET
 import xml.dom.minidom
 from xml.etree.ElementTree import Element, SubElement
 
-from flask import Flask, request, jsonify  # Flask framework for backend API
+from flask import Flask, request, jsonify
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity  # JWT/tokenisation
 
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QLabel, QPushButton, QVBoxLayout, QWidget, QDialog,
-    QLineEdit, QTextEdit, QFormLayout, QFrame, QScrollArea, QHBoxLayout, QMessageBox,
-    QListWidget, QGridLayout, QSizePolicy, QSpinBox, QDateEdit, QFileDialog
+    QApplication, QMainWindow, QWidget, QDialog, QVBoxLayout, QHBoxLayout,
+    QLabel, QLineEdit, QPushButton, QMessageBox, QTextEdit, QFormLayout,
+    QFrame, QScrollArea, QListWidget, QGridLayout, QSizePolicy, QSpinBox,
+    QDateEdit, QFileDialog
 )
 from PyQt6.QtGui import QFont, QMouseEvent, QRegion, QPainterPath
 from PyQt6.QtCore import Qt, QPoint, QTime, QTimer, QRectF, QPropertyAnimation, QEasingCurve, QDate, QRect
 
 
-#Flask app setup
-app = Flask(__name__)  # Initialise Flask application
-ADMINS_FILE = "admin_users.json"  # JSON file to store admin credentials
+app = Flask(__name__)
+ADMINS_FILE = "admin_users.json"
+
+#JWT configuration
+app.config["JWT_SECRET_KEY"] = "super-secret-change-this"  #Secret key used to sign tokens
+app.config["JWT_ACCESS_TOKEN_EXPIRES"] = 3600               #Tokens expire in 1 hour
+jwt = JWTManager(app)  #Initialise JWT manager with Flask app
 
 
-# Load admin credentials from JSON file
 def load_admins():
     if not os.path.exists(ADMINS_FILE):
-        return {}  # Return empty dict if file does not exist
+        return {}
     with open(ADMINS_FILE, "r") as f:
         return json.load(f)
 
-# Save admin credentials to JSON file
+
 def save_admins(admins):
     with open(ADMINS_FILE, "w") as f:
         json.dump(admins, f)
 
 
-#Flask route: Register a new admin
 @app.route("/register", methods=["POST"])
 def register():
-    data = request.json  # Get JSON data from request
+    data = request.json
     username = data.get("username")
     password = data.get("password")
 
-    # Basic validation
     if not username or not password or len(username) < 3 or len(password) < 4:
         return jsonify({"success": False, "message": "Username or password too short"}), 400
 
@@ -53,7 +55,6 @@ def register():
     if username in admins:
         return jsonify({"success": False, "message": "Username already exists"}), 400
 
-    # Hash password before storing
     hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
     admins[username] = hashed.decode("utf-8")
     save_admins(admins)
@@ -61,7 +62,6 @@ def register():
     return jsonify({"success": True, "message": f"Admin '{username}' registered."})
 
 
-#Flask route: Login endpoint
 @app.route("/login", methods=["POST"])
 def login():
     data = request.json
@@ -72,24 +72,31 @@ def login():
     if username not in admins:
         return jsonify({"success": False, "message": "Invalid credentials"}), 401
 
-    # Verify password using bcrypt
     if bcrypt.checkpw(password.encode("utf-8"), admins[username].encode("utf-8")):
-        return jsonify({"success": True, "message": "Login successful"})
+        #create a JWT token for the authenticated user
+        access_token = create_access_token(identity=username)
+        return jsonify({"success": True, "access_token": access_token})
     else:
         return jsonify({"success": False, "message": "Invalid credentials"}), 401
 
 
-#Flask route: Check if any admin exists
 @app.route("/admin_exists", methods=["GET"])
 def admin_exists():
     admins = load_admins()
     return jsonify({"exists": len(admins) > 0})
 
 
-#Function to run the flask server
+@app.route("/protected", methods=["GET"])
+@jwt_required()  #Requires a valid JWT token to access this route
+def protected():
+    #retrieve the username from the token
+    current_user = get_jwt_identity()
+    return jsonify({"message": f"Hello {current_user}, you have access to protected data!"})
+
+
 def run_flask():
-    # Start Flask on port 5000 without debug reloader (prevents multiple threads)
     app.run(port=5000, debug=False, use_reloader=False)
+
 
 
 class AdminLoginDialog(QDialog):
@@ -97,6 +104,7 @@ class AdminLoginDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Admin Login")
         self.setFixedSize(300, 220)
+        self.access_token = None  # store JWT here
 
         layout = QVBoxLayout(self)
 
@@ -135,7 +143,8 @@ class AdminLoginDialog(QDialog):
             response = requests.post("http://127.0.0.1:5000/login", json={"username": user, "password": pw})
             data = response.json()
             if response.status_code == 200 and data.get("success"):
-                QMessageBox.information(self, "Success", "Login successful!")
+                self.access_token = data.get("access_token")
+                QMessageBox.information(self, "Success", "Login successful! Token acquired.")
                 self.accept()
             else:
                 QMessageBox.warning(self, "Login Failed", data.get("message", "Unknown error"))
@@ -157,6 +166,20 @@ class AdminLoginDialog(QDialog):
                 QMessageBox.warning(self, "Error", data.get("message", "Unknown error"))
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Register error: {e}")
+
+    def test_protected_request(self):
+        """ Example: use token to call protected route """
+        if not self.access_token:
+            QMessageBox.warning(self, "Error", "You must login first")
+            return
+        try:
+            headers = {"Authorization": f"Bearer {self.access_token}"}
+            response = requests.get("http://127.0.0.1:5000/protected", headers=headers)
+            data = response.json()
+            QMessageBox.information(self, "Protected Data", data.get("message", "No message"))
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Request error: {e}")
+
 
 class TaskDetailsPopup(QDialog):
     def __init__(self, task, parent=None):
