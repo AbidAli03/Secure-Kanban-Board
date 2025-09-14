@@ -20,7 +20,7 @@ This project is a desktop Kanban task manager built with Python, PyQt6, and Flas
 1. **Clone the repository**  
 2. **Install dependencies**
 - pip install Flask flask-jwt-extended bcrypt PyQt6 requests
-3. ***Run the Flask backend**
+3. **Run the Flask backend**
 - python path/to/flask_backend.py
 4. **Run the PyQt6 frontend**
 -python SkanbanBoard.py
