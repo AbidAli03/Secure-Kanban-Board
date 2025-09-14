@@ -1,7 +1,8 @@
 import os
 import sys
-import xml.etree.ElementTree as ET  # XML read/write (build/parse tree)
-import xml.dom.minidom  # Pretty-print XML for readability
+import csv
+import xml.etree.ElementTree as ET
+import xml.dom.minidom  
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QLabel, QPushButton, QVBoxLayout, QWidget, QDialog,
@@ -10,7 +11,117 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QFont, QMouseEvent, QRegion, QPainterPath
 from PyQt6.QtCore import Qt, QPoint, QTime, QTimer, QRectF, QPropertyAnimation, QEasingCurve, QDate, QRect
-from xml.etree.ElementTree import Element, SubElement  # Shortcuts to build XML elements
+from xml.etree.ElementTree import Element, SubElement
+
+import json
+import bcrypt  # For secure password hashing
+
+# File to store admin usernames and hashed passwords
+ADMINS_FILE = "admin_users.json"
+
+# Load admin data from JSON file
+def load_admins():
+    if not os.path.exists(ADMINS_FILE):
+        return {}  # Return empty dict if file doesn't exist
+    with open(ADMINS_FILE, "r") as f:
+        return json.load(f)
+
+# Save admin data back to JSON file
+def save_admins(admins):
+    with open(ADMINS_FILE, "w") as f:
+        json.dump(admins, f)
+
+# Register a new admin with hashed password
+def register_admin(username, password):
+    admins = load_admins()
+    if username in admins:
+        return False  # Cannot register duplicate usernames
+
+    # Hash the password using bcrypt with a salt
+    hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
+    admins[username] = hashed.decode("utf-8")  # Store as string
+    save_admins(admins)
+    return True
+
+# Verify login credentials using bcrypt
+def verify_admin(username, password):
+    admins = load_admins()
+    if username not in admins:
+        return False
+    # Check if password matches the stored hash
+    return bcrypt.checkpw(password.encode("utf-8"), admins[username].encode("utf-8"))
+
+# Check if any admin exists (for first-time setup)
+def any_admin_exists():
+    admins = load_admins()
+    return len(admins) > 0
+
+
+#pyqt login window
+class AdminLoginDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Admin Login")
+        self.setFixedSize(300, 220)
+
+        #set background color
+        self.setStyleSheet("QDialog { background-color: #f5f5f5; }")
+
+        layout = QVBoxLayout(self)
+
+        # Username input
+        self.username = QLineEdit()
+        self.username.setPlaceholderText("Username")
+        layout.addWidget(self.username)
+
+        # Password input (hidden characters)
+        self.password = QLineEdit()
+        self.password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password.setPlaceholderText("Password")
+        layout.addWidget(self.password)
+
+        # Buttons layout
+        button_layout = QHBoxLayout()
+        self.login_button = QPushButton("Login")
+        self.login_button.clicked.connect(self.try_login)  # Connect login function
+        button_layout.addWidget(self.login_button)
+
+        self.register_button = QPushButton("Register")
+        self.register_button.clicked.connect(self.try_register)  # Connect register function
+        button_layout.addWidget(self.register_button)
+
+        layout.addLayout(button_layout)
+
+        # First-time setup: prompt user to register if no admins exist
+        if not any_admin_exists():
+            QMessageBox.information(self, "First Time Setup", "No admins exist. Please register one.")
+
+    # Attempt login
+    def try_login(self):
+        user = self.username.text().strip()
+        pw = self.password.text()
+        if not verify_admin(user, pw):
+            # Show warning if credentials invalid
+            QMessageBox.warning(self, "Login Failed", "Invalid credentials")
+        else:
+            # Close dialog and accept login
+            self.accept()
+
+    # Attempt to register a new admin
+    def try_register(self):
+        user = self.username.text().strip()
+        pw = self.password.text()
+        if len(user) < 3 or len(pw) < 4:
+            QMessageBox.warning(self, "Error", "Username or password too short")
+            return
+
+        if register_admin(user, pw):
+            # Registration successful
+            QMessageBox.information(self, "Success", f"Admin '{user}' registered.")
+        else:
+            # Username already exists
+            QMessageBox.warning(self, "Error", "Username already exists")
+
 
 class TaskDetailsPopup(QDialog):
     def __init__(self, task, parent=None):
@@ -111,7 +222,6 @@ class TaskDetailsPopup(QDialog):
         self.setLayout(layout)
 
     def save_task_details(self):
-        # Track which fields changed for logging
         changes = []
 
         if self.task.title != self.title_input.text():
@@ -125,7 +235,6 @@ class TaskDetailsPopup(QDialog):
         if self.task.description != self.description_input.toPlainText():
             changes.append("Description")
 
-        # Apply updates to the task object (these values are later saved to XML)
         self.task.title = self.title_input.text()
         self.task.assignee = self.assignee_input.text()
         self.task.start_date = self.start_date_input.date()
@@ -135,7 +244,6 @@ class TaskDetailsPopup(QDialog):
         self.task.setText(self.task.title)
         self.task.update_tooltip()
 
-        # Log edits (logs go to CSV, not XML)
         if changes:
             if hasattr(self.task.kanban_window, "append_log_entry"):
                 self.task.kanban_window.append_log_entry(
@@ -144,6 +252,7 @@ class TaskDetailsPopup(QDialog):
                 )
 
         self.accept()
+
 
 class Task(QLabel):
     def __init__(self, text, kanban_window, parent=None):
@@ -169,7 +278,6 @@ class Task(QLabel):
         self.setMaximumHeight(50)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-        # Task data that will be serialised to XML
         self.title = text
         self.assignee = ""
         self.start_date = QDate.currentDate()
@@ -227,7 +335,6 @@ class Task(QLabel):
         popup.exec()
 
     def update_tooltip(self):
-        # Tooltip combines current task state (these values are what XML persists)
         days_remaining = ""
         if self.end_date and isinstance(self.end_date, QDate):
             today = QDate.currentDate()
@@ -273,11 +380,9 @@ class Task(QLabel):
             print(f"Error deleting task: {e}")
 
     def to_xml(self):
-        # Convert this Task to an XML <task> element with child tags
         task_element = Element("task")
         SubElement(task_element, "title").text = self.title
         SubElement(task_element, "assignee").text = self.assignee
-        # Dates stored as strings so they are easy to parse later
         SubElement(task_element, "start_date").text = self.start_date.toString("yyyy-MM-dd")
         SubElement(task_element, "end_date").text = self.end_date.toString("yyyy-MM-dd")
         SubElement(task_element, "description").text = self.description
@@ -285,7 +390,6 @@ class Task(QLabel):
 
     @classmethod
     def from_xml(cls, xml_element, kanban_window, parent=None):
-        # Build a Task object from a <task> XML element
         title = xml_element.find("title").text
         task = cls(title, kanban_window, parent)
         task.assignee = xml_element.find("assignee").text
@@ -299,12 +403,13 @@ class Task(QLabel):
         task.update_tooltip()
         return task
 
+
 class Column(QFrame):
     def __init__(self, title, parent_board):
         super().__init__()
         self.parent_board = parent_board
         self.title = title
-        self.wip_limit = 0  # Saved to XML as an attribute on <column>
+        self.wip_limit = 0
 
         self.setStyleSheet("""
             QFrame {
@@ -378,7 +483,7 @@ class Column(QFrame):
             color: #E0E0E0;
         """)
         self.header_layout.addWidget(self.label)
-        self.label.mouseDoubleClickEvent = self.label_double_clicked  # Rename on double click (name persisted in XML)
+        self.label.mouseDoubleClickEvent = self.label_double_clicked
 
         self.control_layout = QHBoxLayout()
         self.control_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -434,6 +539,7 @@ class Column(QFrame):
         self.task_container.layout().setAlignment(Qt.AlignmentFlag.AlignTop)
         self.task_container.layout().setSpacing(8)
         self.task_container.layout().setContentsMargins(5, 5, 5, 5)
+
         self.scroll_area.setWidget(self.task_container)
         self.layout.addWidget(self.scroll_area)
 
@@ -467,7 +573,6 @@ class Column(QFrame):
             previous_limit = self.wip_limit
             self.wip_limit = spin_box.value()
             self.update_wip_display()
-            # Log changes (CSV). WIP is also persisted in XML as column attribute.
             if previous_limit == 0 and self.wip_limit > 0:
                 self.parent_board.append_log_entry("WIP Limit Set",
                     f"WIP limit for '{self.title}' set to {self.wip_limit}")
@@ -512,17 +617,17 @@ class Column(QFrame):
         return count
 
     def remove_task(self, task):
-        layout = self.task_container.layout()
-        if layout.indexOf(task) != -1:
-            layout.removeWidget(task)
-            task.setParent(None)
-            task.column = None
-            layout.update()
-            self.task_container.update()
-            self.update()
-            QApplication.processEvents()
+            layout = self.task_container.layout()
+            if layout.indexOf(task) != -1:
+                layout.removeWidget(task)
+                task.setParent(None)
+                task.column = None
+                layout.update()
+                self.task_container.update()
+                self.update()
+                QApplication.processEvents()
 
-        self.update_wip_display()
+            self.update_wip_display()
 
     def label_double_clicked(self, event):
         if self.title == "To Do":
@@ -537,7 +642,6 @@ class Column(QFrame):
         old_title = self.title
         new_title = self.edit_line.text().strip()
         if new_title and new_title != old_title:
-            # Prevent duplicate "To Do" columns
             if new_title.lower() == "to do":
                 for col in self.parent_board.columns:
                     if col is not self and col.title.lower() == "to do":
@@ -552,7 +656,6 @@ class Column(QFrame):
 
             self.label.setText(new_title)
             self.title = new_title
-            # Column title is saved into XML attribute on next save
             if hasattr(self.parent_board, "append_log_entry"):
                 self.parent_board.append_log_entry(
                     "Column Renamed",
@@ -599,7 +702,6 @@ class Column(QFrame):
             self.parent_board.append_log_entry("Column Deleted", f"'{self.title}' column deleted")
 
     def add_task(self, task):
-        # Enforce WIP (also reflected in XML as wip_limit attribute)
         if self.wip_limit > 0 and self.get_task_count() >= self.wip_limit:
             return False
 
@@ -615,6 +717,7 @@ class Column(QFrame):
                 return i
         return -1
 
+
 class KanbanWindow(QMainWindow):
     def __init__(self, user_name="", is_Admin=False):
         super().__init__()
@@ -623,7 +726,6 @@ class KanbanWindow(QMainWindow):
         self.setFixedSize(1200, 700)
         self.round_window()
 
-        # The project name doubles as the XML filename prefix
         self.user_name = user_name
         self.is_Admin = is_Admin
         self.filename = f"{self.user_name}.xml"
@@ -706,7 +808,6 @@ class KanbanWindow(QMainWindow):
         self.setCentralWidget(container)
         self.setStyleSheet("background-color: white;")
 
-        # Load board state from XML on startup (if file exists)
         self.load_from_xml()
 
     def round_window(self, radius=20):
@@ -732,7 +833,6 @@ class KanbanWindow(QMainWindow):
         self.task_counter_label.setText(f"Tasks: {self.task_counter}/50")
 
     def append_log_entry(self, action, details):
-        # CSV log for user actions (not XML). Used for audit/tracking.
         from datetime import datetime
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_folder = "Project Files"
@@ -760,7 +860,6 @@ class KanbanWindow(QMainWindow):
         self.append_log_entry("Column Created", f"'{title}' column added")
 
     def remove_column(self, column):
-        # When removing, also update the counter; tasks themselves are removed from UI
         task_layout = column.task_container.layout()
         task_count = sum(1 for i in range(task_layout.count())
                          if isinstance(task_layout.itemAt(i).widget(), Task))
@@ -772,7 +871,6 @@ class KanbanWindow(QMainWindow):
         self.append_log_entry("Column Removed", f"'{column.title}' column removed")
 
     def rearrange_columns(self):
-        # Reposition columns in the grid (not persisted; only layout)
         for i in reversed(range(self.board_layout.count())):
             self.board_layout.itemAt(i).widget().setParent(None)
         for index, column in enumerate(self.columns):
@@ -800,7 +898,6 @@ class KanbanWindow(QMainWindow):
     def create_task(self):
         if self.task_counter >= self.max_tasks:
             return
-        # New tasks default into "To Do" column and will be included in XML on save
         to_do_column = next((col for col in self.columns if col.title == "To Do"), None)
         if to_do_column:
             task = Task(f"Task {self.task_counter + 1}", self, to_do_column.task_container)
@@ -811,135 +908,108 @@ class KanbanWindow(QMainWindow):
             to_do_column.update_wip_display()
 
     def snap_to_column(self, task):
-        # Handles drag-and-drop move between columns (state change logged; saved to XML on save)
-        original_column = task.column
-        original_index = -1
-        if original_column:
-            layout = original_column.task_container.layout()
-            for i in range(layout.count()):
-                if layout.itemAt(i).widget() == task:
-                    original_index = i
+            original_column = task.column
+            original_index = -1
+            if original_column:
+                layout = original_column.task_container.layout()
+                for i in range(layout.count()):
+                  if layout.itemAt(i).widget() == task:
+                     original_index = i
+                     break
+
+            closest_column = None
+            task_rect = QRect(task.mapToGlobal(QPoint(0, 0)), task.size())
+            for column in self.columns:
+                column_rect = QRect(column.mapToGlobal(QPoint(0, 0)), column.size())
+                if column_rect.intersects(task_rect):
+                    closest_column = column
                     break
 
-        closest_column = None
-        task_rect = QRect(task.mapToGlobal(QPoint(0, 0)), task.size())
-        for column in self.columns:
-            column_rect = QRect(column.mapToGlobal(QPoint(0, 0)), column.size())
-            if column_rect.intersects(task_rect):
-                closest_column = column
-                break
-
-        if closest_column and closest_column != original_column:
-            if original_column:
-                original_column.remove_task(task)
-
-            if closest_column.add_task(task):
-                self.append_log_entry("Task Moved", f"'{task.title}' moved to '{closest_column.title}'")
-                return True
-            else:
+            if closest_column and closest_column != original_column:
                 if original_column:
-                    original_column.task_container.layout().insertWidget(original_index, task)
-                    task.setParent(original_column.task_container)
-                    task.column = original_column
-                    task.show()
-                    original_column.update_wip_display()
-                return False
+                    original_column.remove_task(task)
 
-        if original_column:
-            original_column.task_container.layout().insertWidget(original_index, task)
-            task.setParent(original_column.task_container)
-            task.column = original_column
-            task.show()
-            original_column.update_wip_display()
+                if closest_column.add_task(task):
+                    self.append_log_entry("Task Moved", f"'{task.title}' moved to '{closest_column.title}'")
+                    return True
+                else:
+                    if original_column:
+                       original_column.task_container.layout().insertWidget(original_index, task)
+                       task.setParent(original_column.task_container)
+                       task.column = original_column
+                       task.show()
+                       original_column.update_wip_display()
+                    return False
 
-        return False
+            if original_column:
+                original_column.task_container.layout().insertWidget(original_index, task)
+                task.setParent(original_column.task_container)
+                task.column = original_column
+                task.show()
+                original_column.update_wip_display()
+
+            return False
 
     def save_to_xml(self):
-        # Serialise the entire board to an XML file:
-        # <kanban_board>
-        #   <column name="..." wip_limit="...">
-        #       <task>...</task>
-        #   </column>
-        # </kanban_board>
         if not self.user_name:
             return
         folder_path = "Project Files"
         os.makedirs(folder_path, exist_ok=True)
         file_path = os.path.join(folder_path, f"{self.user_name}.xml")
-
         root = ET.Element("kanban_board")
         for column in self.columns:
-            # Column data saved as element with attributes for title and WIP
             column_element = ET.SubElement(root, "column", name=column.title, wip_limit=str(column.wip_limit))
-            # Add each Task as a child <task> element
             for i in range(column.task_container.layout().count()):
                 task_widget = column.task_container.layout().itemAt(i).widget()
                 if isinstance(task_widget, Task):
                     column_element.append(task_widget.to_xml())
-
-        # Pretty-print the XML (just for readability on disk)
         rough_string = ET.tostring(root, 'utf-8')
         reparsed = xml.dom.minidom.parseString(rough_string)
         pretty_xml_as_string = reparsed.toprettyxml(indent="  ")
-
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(pretty_xml_as_string)
 
     def load_from_xml(self):
-        # Load board state from XML; if file missing, create default "To Do" column
         try:
-            # Clear existing columns before loading
             for column in self.columns[:]:
                 self.remove_column(column)
-
             folder_path = "Project Files"
             file_path = os.path.join(folder_path, self.filename)
-            tree = ET.parse(file_path)  # Parse XML file into an ElementTree
+            tree = ET.parse(file_path)
             root = tree.getroot()
-
             for column_element in root.findall("column"):
                 column_name = column_element.get("name")
                 self.add_column(column_name)
                 column = self.columns[-1]
-
-                # WIP limit stored as attribute string; convert to int
                 wip_limit_str = column_element.get("wip_limit", "0")
                 try:
                     column.wip_limit = int(wip_limit_str)
                     column.update_wip_display()
                 except ValueError:
                     column.wip_limit = 0
-
                 column.wip_button.setVisible(self.is_Admin)
-
-                # Recreate each task from its XML
                 for task_element in column_element.findall("task"):
                     task = Task.from_xml(task_element, self, column.task_container)
                     column.add_task(task)
                     self.task_counter += 1
-
             self.task_counter_label.setText(f"Tasks: {self.task_counter}/50")
-
         except FileNotFoundError:
-            # No saved XML: start with a basic board
             self.add_column("To Do")
             for column in self.columns:
                 column.wip_button.setVisible(self.is_Admin)
         except ET.ParseError as e:
-            # Bad/malformed XML: notify user
             QMessageBox.critical(self, "XML Error", f"Error parsing XML file: {e}")
 
     def save_and_close(self):
-        # Save current state to XML then close window
         self.save_to_xml()
         self.close()
 
     def open_main_menu(self):
-        # Save current state to XML and go back to main menu
         self.save_to_xml()
         self.close()
         self.main_menu = MainMenu()
         self.main_menu.show()
+
 
 class LoadingScreen(QDialog):
     def __init__(self):
@@ -1010,6 +1080,7 @@ class LoadingScreen(QDialog):
         self.close()
         self.main_menu = MainMenu()
         self.main_menu.show()
+
 
 class MainMenu(QWidget):
     def __init__(self, saved_user_name=""):
@@ -1085,13 +1156,12 @@ class MainMenu(QWidget):
             self.close()
 
     def load_saved_boards(self):
-        # Read available project names by listing XML files in the folder
         saved_boards = []
         folder_path = "Project Files"
         if os.path.exists(folder_path):
             for filename in os.listdir(folder_path):
                 if filename.endswith(".xml"):
-                    saved_boards.append(filename[:-4])  # strip .xml
+                    saved_boards.append(filename[:-4])
         saved_boards.sort()
         return saved_boards
 
@@ -1131,6 +1201,9 @@ class MainMenu(QWidget):
 
         name_input = None
         if user_type == "Admin":
+            login_dialog = AdminLoginDialog(self)
+            if login_dialog.exec() != QDialog.DialogCode.Accepted:
+                return
 
             name_input = QLineEdit(container)
             name_input.setPlaceholderText("Enter project name here")
@@ -1257,7 +1330,6 @@ class MainMenu(QWidget):
         current_pos = self.pos()
         self.close()
         is_Admin = user_type == "Admin"
-        # Opening a board will load its state from its XML file
         self.kanban_window = KanbanWindow(self.user_name, is_Admin)
         self.kanban_window.move(current_pos)
         self.kanban_window.show()
@@ -1277,9 +1349,9 @@ class MainMenu(QWidget):
             self.show_message("Error", "Please select a project to download logs.", QMessageBox.Icon.Warning)
 
     def download_project_file(self, project_name):
-        # Copies the project's XML file to a chosen location
         folder_path = os.path.abspath("Project Files")
         file_path = os.path.join(folder_path, f"{project_name}.xml")
+
         if not os.path.exists(file_path):
             self.show_message("Error", f"The file '{project_name}.xml' does not exist.", QMessageBox.Icon.Warning)
             return
@@ -1295,7 +1367,6 @@ class MainMenu(QWidget):
                 self.show_message("Error", f"Failed to save file: {e}", QMessageBox.Icon.Critical)
 
     def download_log_file(self, project_name):
-        # Copies the CSV log file to a chosen location (separate from XML)
         folder_path = os.path.abspath("Project Files")
         file_path = os.path.join(folder_path, f"Log_{project_name}.csv")
 
@@ -1314,7 +1385,6 @@ class MainMenu(QWidget):
                 self.show_message("Error", f"Failed to save log file: {e}", QMessageBox.Icon.Critical)
 
     def delete_project(self, name_list):
-        # Deletes only the XML (keeps logs), also appends a log entry
         selected_item = name_list.currentItem()
         if selected_item:
             project_name = selected_item.text()
@@ -1382,11 +1452,13 @@ class MainMenu(QWidget):
         """)
         msg.exec()
 
+
 class KanbanApp(QApplication):
     def __init__(self, sys_argv):
         super().__init__(sys_argv)
         self.loading_screen = LoadingScreen()
         self.loading_screen.show()
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
@@ -1410,3 +1482,4 @@ if __name__ == "__main__":
     """)
     kanban_app = KanbanApp(sys.argv)
     sys.exit(app.exec())
+
