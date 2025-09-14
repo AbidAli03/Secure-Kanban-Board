@@ -1,8 +1,15 @@
 import os
 import sys
 import csv
+import json
+import bcrypt
+import threading
+import requests
 import xml.etree.ElementTree as ET
-import xml.dom.minidom  
+import xml.dom.minidom
+from xml.etree.ElementTree import Element, SubElement
+
+from flask import Flask, request, jsonify  # Flask framework for backend API
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QLabel, QPushButton, QVBoxLayout, QWidget, QDialog,
@@ -11,117 +18,145 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QFont, QMouseEvent, QRegion, QPainterPath
 from PyQt6.QtCore import Qt, QPoint, QTime, QTimer, QRectF, QPropertyAnimation, QEasingCurve, QDate, QRect
-from xml.etree.ElementTree import Element, SubElement
 
-import json
-import bcrypt  # For secure password hashing
 
-# File to store admin usernames and hashed passwords
-ADMINS_FILE = "admin_users.json"
+#Flask app setup
+app = Flask(__name__)  # Initialise Flask application
+ADMINS_FILE = "admin_users.json"  # JSON file to store admin credentials
 
-# Load admin data from JSON file
+
+# Load admin credentials from JSON file
 def load_admins():
     if not os.path.exists(ADMINS_FILE):
-        return {}  # Return empty dict if file doesn't exist
+        return {}  # Return empty dict if file does not exist
     with open(ADMINS_FILE, "r") as f:
         return json.load(f)
 
-# Save admin data back to JSON file
+# Save admin credentials to JSON file
 def save_admins(admins):
     with open(ADMINS_FILE, "w") as f:
         json.dump(admins, f)
 
-# Register a new admin with hashed password
-def register_admin(username, password):
+
+#Flask route: Register a new admin
+@app.route("/register", methods=["POST"])
+def register():
+    data = request.json  # Get JSON data from request
+    username = data.get("username")
+    password = data.get("password")
+
+    # Basic validation
+    if not username or not password or len(username) < 3 or len(password) < 4:
+        return jsonify({"success": False, "message": "Username or password too short"}), 400
+
     admins = load_admins()
     if username in admins:
-        return False  # Cannot register duplicate usernames
+        return jsonify({"success": False, "message": "Username already exists"}), 400
 
-    # Hash the password using bcrypt with a salt
+    # Hash password before storing
     hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
-    admins[username] = hashed.decode("utf-8")  # Store as string
+    admins[username] = hashed.decode("utf-8")
     save_admins(admins)
-    return True
 
-# Verify login credentials using bcrypt
-def verify_admin(username, password):
+    return jsonify({"success": True, "message": f"Admin '{username}' registered."})
+
+
+#Flask route: Login endpoint
+@app.route("/login", methods=["POST"])
+def login():
+    data = request.json
+    username = data.get("username")
+    password = data.get("password")
+
     admins = load_admins()
     if username not in admins:
-        return False
-    # Check if password matches the stored hash
-    return bcrypt.checkpw(password.encode("utf-8"), admins[username].encode("utf-8"))
+        return jsonify({"success": False, "message": "Invalid credentials"}), 401
 
-# Check if any admin exists (for first-time setup)
-def any_admin_exists():
+    # Verify password using bcrypt
+    if bcrypt.checkpw(password.encode("utf-8"), admins[username].encode("utf-8")):
+        return jsonify({"success": True, "message": "Login successful"})
+    else:
+        return jsonify({"success": False, "message": "Invalid credentials"}), 401
+
+
+#Flask route: Check if any admin exists
+@app.route("/admin_exists", methods=["GET"])
+def admin_exists():
     admins = load_admins()
-    return len(admins) > 0
+    return jsonify({"exists": len(admins) > 0})
 
 
-#pyqt login window
+#Function to run the flask server
+def run_flask():
+    # Start Flask on port 5000 without debug reloader (prevents multiple threads)
+    app.run(port=5000, debug=False, use_reloader=False)
+
+
 class AdminLoginDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Admin Login")
         self.setFixedSize(300, 220)
 
-        #set background color
-        self.setStyleSheet("QDialog { background-color: #f5f5f5; }")
-
         layout = QVBoxLayout(self)
 
-        # Username input
         self.username = QLineEdit()
         self.username.setPlaceholderText("Username")
         layout.addWidget(self.username)
 
-        # Password input (hidden characters)
         self.password = QLineEdit()
         self.password.setEchoMode(QLineEdit.EchoMode.Password)
         self.password.setPlaceholderText("Password")
         layout.addWidget(self.password)
 
-        # Buttons layout
         button_layout = QHBoxLayout()
         self.login_button = QPushButton("Login")
-        self.login_button.clicked.connect(self.try_login)  # Connect login function
+        self.login_button.clicked.connect(self.try_login)
         button_layout.addWidget(self.login_button)
 
         self.register_button = QPushButton("Register")
-        self.register_button.clicked.connect(self.try_register)  # Connect register function
+        self.register_button.clicked.connect(self.try_register)
         button_layout.addWidget(self.register_button)
 
         layout.addLayout(button_layout)
 
-        # First-time setup: prompt user to register if no admins exist
-        if not any_admin_exists():
-            QMessageBox.information(self, "First Time Setup", "No admins exist. Please register one.")
+        # Check if any admins exist (call Flask backend)
+        try:
+            response = requests.get("http://127.0.0.1:5000/admin_exists")
+            if response.status_code == 200 and not response.json().get("exists", False):
+                QMessageBox.information(self, "First Time Setup", "No admins exist. Please register one.")
+        except Exception:
+            QMessageBox.warning(self, "Error", "Could not connect to auth server. Make sure backend is running.")
 
-    # Attempt login
     def try_login(self):
         user = self.username.text().strip()
         pw = self.password.text()
-        if not verify_admin(user, pw):
-            # Show warning if credentials invalid
-            QMessageBox.warning(self, "Login Failed", "Invalid credentials")
-        else:
-            # Close dialog and accept login
-            self.accept()
+        try:
+            response = requests.post("http://127.0.0.1:5000/login", json={"username": user, "password": pw})
+            data = response.json()
+            if response.status_code == 200 and data.get("success"):
+                QMessageBox.information(self, "Success", "Login successful!")
+                self.accept()
+            else:
+                QMessageBox.warning(self, "Login Failed", data.get("message", "Unknown error"))
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Login error: {e}")
 
-    # Attempt to register a new admin
     def try_register(self):
         user = self.username.text().strip()
         pw = self.password.text()
         if len(user) < 3 or len(pw) < 4:
             QMessageBox.warning(self, "Error", "Username or password too short")
             return
-
-        if register_admin(user, pw):
-            # Registration successful
-            QMessageBox.information(self, "Success", f"Admin '{user}' registered.")
-        else:
-            # Username already exists
-            QMessageBox.warning(self, "Error", "Username already exists")
-
+        try:
+            response = requests.post("http://127.0.0.1:5000/register", json={"username": user, "password": pw})
+            data = response.json()
+            if response.status_code == 200 and data.get("success"):
+                QMessageBox.information(self, "Success", data.get("message"))
+            else:
+                QMessageBox.warning(self, "Error", data.get("message", "Unknown error"))
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Register error: {e}")
 
 class TaskDetailsPopup(QDialog):
     def __init__(self, task, parent=None):
@@ -1461,6 +1496,11 @@ class KanbanApp(QApplication):
 
 
 if __name__ == "__main__":
+    # Start Flask backend in a thread
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+
+    # Start PyQt app
     app = QApplication(sys.argv)
     app.setStyleSheet("""
         QMessageBox {
@@ -1480,6 +1520,8 @@ if __name__ == "__main__":
             background-color: #eee;
         }
     """)
-    kanban_app = KanbanApp(sys.argv)
+
+    kanban_app = KanbanApp(sys.argv)  # Your existing main app class
     sys.exit(app.exec())
+
 
